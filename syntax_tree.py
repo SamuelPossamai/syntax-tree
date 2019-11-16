@@ -1,54 +1,92 @@
 
+from abc import ABC, abstractmethod
+
 import re
 
-class NodeRule:
+class NodeRule(ABC):
 
-    def __init__(self, types, re_match, re_filter=None):
+    @abstractmethod
+    def applyRule(self, node):
+        pass
+
+class RegexNodeRule(NodeRule):
+
+    def __init__(self, types, re_match, re_filter=None, redo=False):
 
         self.__types = set(types)
-        self.__re_match = re_match
+        self.__redo = bool(redo)
+
+        if isinstance(re_match, str):
+            self.__re_match = (re_match,)
+        else:
+            self.__re_match = tuple(re_match)
 
         if re_filter is None:
             self.__re_filter = re_match
         else:
-            self.__re_filter = re_filter
+            if isinstance(re_filter, str):
+                self.__re_filter = (re_filter,)
+            else:
+                self.__re_filter = tuple(re_filter)
+
+            if len(self.__re_match) != len(self.__re_filter):
+                raise ValueError('Match and filter size differ.')
 
     def applyRule(self, node):
 
         if node.type_ not in self.__types:
-            return False
+            return False, (), ()
 
         val = node.value
 
-        match = re.search(self.__re_match, val)
+        cur_string = val
+        str_list = []
+        filter_list = []
+        for re_match, re_filter in zip(self.__re_match, self.__re_filter):
 
-        if match is None:
-            return False, ()
+            match = re.search(re_match, cur_string)
 
-        span = match.span()
+            if match is None:
+                return False, (), ()
 
-        match_string = val[span[0]:span[1]]
+            span = match.span()
 
-        match_filtered = re.search(self.__re_filter, match_string)
+            match_string = cur_string[span[0]:span[1]]
 
-        if match_filtered is None:
-            return False, ()
+            match_filtered = re.search(re_filter, match_string)
 
-        filtered_span = match_filtered.span()
+            if match_filtered is None:
+                return False, (), ()
 
-        before = val[:span[0]+filtered_span[0]]
-        after = val[span[1]-(len(match_string) - filtered_span[1]):]
-        match_string = match_string[filtered_span[0]:filtered_span[1]]
+            filtered_span = match_filtered.span()
 
-        node.value = match_string
-        child_before = SyntaxTreeElement(before)
-        child_after = SyntaxTreeElement(after)
+            before = cur_string[:span[0]+filtered_span[0]]
+            after = cur_string[span[1]-(len(match_string) - filtered_span[1]):]
+            match_string = match_string[filtered_span[0]:filtered_span[1]]
 
-        node.addChild(child_before)
-        node.addChild(child_after)
+            str_list.append(before)
+            filter_list.append(match_string)
 
-        return True, (child_before, child_after)
+            cur_string = after
 
+        str_list.append(after)
+
+        childs = []
+        for child_str in str_list:
+
+            cur_child = SyntaxTreeElement(child_str)
+
+            node.addChild(cur_child)
+
+        if len(filter_list) == 1:
+            node.value = filter_list[0]
+        else:
+            node.value = tuple(filter_list)
+
+        node_children = node.children
+        if self.__redo:
+            node_children = tuple(node_children)
+        return True, node_children, node_children if self.__redo else ()
 
 class SyntaxTreeElement:
 
@@ -79,7 +117,7 @@ class SyntaxTreeElement:
 
     @property
     def children(self):
-        return self.__children
+        return iter(self.__children)
 
     def addChild(self, el):
         self.__children.append(el)
@@ -120,11 +158,18 @@ class SyntaxTree:
         self.__expr = expr
         self.__root = SyntaxTreeElement(expr)
 
-        leaves = [self.__root]
+        leaves = []
+        redo_list = [self.__root]
 
-        for rule in self.__node_rules:
-            while(self.__apply_rule(leaves, rule)):
-                pass
+        while redo_list:
+            cur_leaves = redo_list
+            redo_list = []
+            for rule in self.__node_rules:
+                while(self.__apply_rule(cur_leaves, rule, redo_list)):
+                    pass
+
+            leaves.extend(cur_leaves)
+            cur_leaves = redo_list
 
         for leaf in leaves:
             for leaf_type, leaf_type_rule, leaf_type_filter in \
@@ -142,20 +187,23 @@ class SyntaxTree:
 
                     break
             else:
+                continue
                 raise Exception(
                     f'Couldn\'t find a meaning for \'{leaf.value.strip()}\'')
 
     @staticmethod
-    def __apply_rule(leaves, rule):
+    def __apply_rule(leaves, rule, redo_list):
 
         modified = False
 
         for i, leaf in enumerate(leaves):
 
-            applied, new_leaves = rule.applyRule(leaf)
+            applied, new_leaves, redo_list_add = rule.applyRule(leaf)
             if applied is True:
                 modified = True
                 leaves[i:i + 1] = new_leaves
+
+                redo_list.extend(redo_list_add)
 
         return modified
 
@@ -166,16 +214,24 @@ class SyntaxTree:
 leaf_types = [
 
     ("Integer", "^\s*[0-9]+\s*$", "[0-9]+"),
-    ("Word", "^\s*[A-Za-z_][A-Za-z_0-9]*\s*$", "[A-Za-z_][A-Za-z_0-9]*")
+    ("Word", "^\s*[A-Za-z_][A-Za-z_0-9]*\s*$", "[A-Za-z_][A-Za-z_0-9]*"),
+    ("Empty", "^\s*$", ''),
 ]
 
 node_rules = [
 
-    NodeRule(('Expression',), r'\b\s*[+-]\s*\b', re_filter='[+-]'),
-    NodeRule(('Expression',), r'\b\s*[*/%]\s*\b', re_filter='[*/%]')
+    RegexNodeRule(('Expression',),
+                  (r'(^[^(]*(\s|[A-Za-z0-9_(]|^)[+-](\s|[A-Za-z0-9_(]|$)|'
+                   r'(\s|[A-Za-z0-9_(]|^)[+-](\s|[A-Za-z0-9_(]|$)[^)]$)'),
+                  re_filter='[+-]'),
+    RegexNodeRule(('Expression',),
+                  r'^[^(]*(\s|[A-Za-z0-9_(]|^)[*/%](\s|[A-Za-z0-9_(]|$)',
+                  re_filter='[*/%]'),
+    RegexNodeRule(('Expression',), (r'^\s*\([^)]*\)\s*$', r'\)'),
+                  re_filter=('\(', '\)'), redo=True),
 ]
 
-syntax_tree = SyntaxTree('2 + 4 + 2*7 + 12 - 5',
+syntax_tree = SyntaxTree('2 + 4 + 2*7 + 12 - 5 + 8*(3 + 5) + 3',
                          leaf_rules=leaf_types,
                          node_rules=node_rules)
 
