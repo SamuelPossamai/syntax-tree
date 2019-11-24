@@ -2,14 +2,47 @@
 from abc import ABC, abstractmethod
 
 import re
+import itertools
 
 class NodeRule(ABC):
 
+    class Modifier:
+
+        def __init__(self, name: str):
+            self.__name = name
+
+        def getInfo(self, info_name):
+            return None
+
+        @abstractmethod
+        def action(self, *args, **kwargs):
+            pass
+
     @abstractmethod
-    def applyRule(self, node):
+    def applyRule(self, node, modifiers):
         pass
 
 class RegexNodeRule(NodeRule):
+
+    class NotInModifier(NodeRule.Modifier):
+
+        def __init__(self, not_in_regex):
+            self.__not_in_regex = not_in_regex
+
+        def getInfo(self, info):
+            if info == 'regex':
+                return self.__not_in_regex
+
+            return None
+
+        def action(self, *args, **kwargs):
+
+            if not args:
+                return ()
+
+            return RegexNodeRule._group_rangelist(
+                match.span() for match in re.finditer(
+                    self.__not_in_regex, args[0]))
 
     def __init__(self, types, re_match, re_filter=None, redo=False):
 
@@ -32,16 +65,27 @@ class RegexNodeRule(NodeRule):
             if len(self.__re_match) != len(self.__re_filter):
                 raise ValueError('Match and filter size differ.')
 
-    def applyRule(self, node):
+    def applyRule(self, node, modifiers):
 
         if node.type_ not in self.__types:
             return False, (), ()
 
         val = node.value
 
+        not_in_modifs = tuple(modif for modif in modifiers
+                              if isinstance(modif, RegexNodeRule.NotInModifier))
+
+        not_in_ranges = list(itertools.chain(
+            *(modif.action(val) for modif in not_in_modifs)))
+
+        not_in_ranges.sort()
+        not_in_ranges = RegexNodeRule._group_rangelist(not_in_ranges)
+
         cur_string = val
+        str_offset = 0
         str_list = []
         filter_list = []
+        after = None
         for re_match, re_filter in zip(self.__re_match, self.__re_filter):
 
             match = re.search(re_match, cur_string)
@@ -60,14 +104,26 @@ class RegexNodeRule(NodeRule):
 
             filtered_span = match_filtered.span()
 
+            abs_filtered_span = (filtered_span[0] + span[0] + str_offset,
+                                 filtered_span[1] + span[0] + str_offset)
+            if RegexNodeRule._test_in_ranges(abs_filtered_span, not_in_ranges):
+                print(abs_filtered_span, not_in_ranges)
+                continue
+
+            str_offset_diff = span[1]-(len(match_string) - filtered_span[1])
+
             before = cur_string[:span[0]+filtered_span[0]]
-            after = cur_string[span[1]-(len(match_string) - filtered_span[1]):]
+            after = cur_string[str_offset_diff:]
             match_string = match_string[filtered_span[0]:filtered_span[1]]
 
             str_list.append(before)
             filter_list.append(match_string)
 
+            str_offset += str_offset_diff
             cur_string = after
+
+        if after is None:
+            return False, (), ()
 
         str_list.append(after)
 
@@ -87,6 +143,38 @@ class RegexNodeRule(NodeRule):
         if self.__redo:
             node_children = tuple(node_children)
         return True, node_children, node_children if self.__redo else ()
+
+    @staticmethod
+    def _test_in_ranges(val, range_list):
+
+        for range_pair in range_list:
+            if not(val[1] < range_pair[0] or val[0] > range_pair[1]):
+                return True
+
+        return False
+
+    @staticmethod
+    def _group_rangelist(range_list):
+
+        range_list_iter = iter(range_list)
+
+        cur_start, cur_end = next(range_list_iter, (None, None))
+
+        if cur_start is None:
+            return []
+
+        result = []
+        for start, end in range_list_iter:
+            if start < cur_end:
+                cur_end = end
+            else:
+                result.append((cur_start, cur_end))
+                cur_start = start
+                cur_end = end
+
+        result.append((cur_start, cur_end))
+
+        return result
 
 class SyntaxTreeElement:
 
@@ -142,7 +230,8 @@ class SyntaxTreeElement:
 
 class SyntaxTree:
 
-    def __init__(self, expr, leaf_rules=None, node_rules=None):
+    def __init__(self, expr, leaf_rules=None, node_rules=None,
+                 node_rules_modif=None):
 
         if leaf_rules:
             self.__leaf_rules = leaf_rules.copy()
@@ -152,9 +241,13 @@ class SyntaxTree:
         if node_rules:
             self.__node_rules = node_rules.copy()
         else:
-            self.__node_rules = ()
+            self.__node_rules = []
 
-        self.__node_rules = node_rules or ()
+        if node_rules_modif:
+            self.__node_rules_modif = node_rules_modif.copy()
+        else:
+            self.__node_rules_modif = {}
+
         self.__expr = expr
         self.__root = SyntaxTreeElement(expr)
 
@@ -164,8 +257,12 @@ class SyntaxTree:
         while redo_list:
             cur_leaves = redo_list
             redo_list = []
-            for rule in self.__node_rules:
-                while(self.__apply_rule(cur_leaves, rule, redo_list)):
+            for rule, rule_group in self.__node_rules:
+                while(self.__apply_rule(cur_leaves,
+                                        rule,
+                                        self.__node_rules_modif.get(
+                                            rule_group, ()),
+                                        redo_list)):
                     pass
 
             leaves.extend(cur_leaves)
@@ -192,13 +289,13 @@ class SyntaxTree:
                     f'Couldn\'t find a meaning for \'{leaf.value.strip()}\'')
 
     @staticmethod
-    def __apply_rule(leaves, rule, redo_list):
+    def __apply_rule(leaves, rule, modifiers, redo_list):
 
         modified = False
 
         for i, leaf in enumerate(leaves):
 
-            applied, new_leaves, redo_list_add = rule.applyRule(leaf)
+            applied, new_leaves, redo_list_add = rule.applyRule(leaf, modifiers)
             if applied is True:
                 modified = True
                 leaves[i:i + 1] = new_leaves
@@ -220,19 +317,25 @@ leaf_types = [
 
 node_rules = [
 
-    RegexNodeRule(('Expression',),
-                  (r'(^[^(]*(\s|[A-Za-z0-9_(]|^)[+-](\s|[A-Za-z0-9_(]|$)|'
-                   r'(\s|[A-Za-z0-9_(]|^)[+-](\s|[A-Za-z0-9_(]|$)[^)]$)'),
-                  re_filter='[+-]'),
-    RegexNodeRule(('Expression',),
-                  r'^[^(]*(\s|[A-Za-z0-9_(]|^)[*/%](\s|[A-Za-z0-9_(]|$)',
-                  re_filter='[*/%]'),
-    RegexNodeRule(('Expression',), (r'^\s*\([^)]*\)\s*$', r'\)'),
-                  re_filter=('\(', '\)'), redo=True),
+    (RegexNodeRule(('Expression',),
+                   (r'((\s|[A-Za-z0-9_(]|^)[+-](\s|[A-Za-z0-9_(]|$)|'
+                    r'(\s|[A-Za-z0-9_(]|^)[+-](\s|[A-Za-z0-9_(]|$))'),
+                   re_filter='[+-]'), 'op'),
+    (RegexNodeRule(('Expression',),
+                   r'^[^(]*(\s|[A-Za-z0-9_(]|^)[*/%](\s|[A-Za-z0-9_(]|$)',
+                   re_filter='[*/%]'), 'op'),
+    (RegexNodeRule(('Expression',), (r'^\s*\(', r'\)\s*$'),
+                   re_filter=('\(', '\)'), redo=True), 'par'),
 ]
 
-syntax_tree = SyntaxTree('2 + 4 + 2*7 + 12 - 5 + 8*(3 + 5) + 3',
+node_rules_modif = {
+
+    'op': (RegexNodeRule.NotInModifier(r'\([^)]*\)'),)
+}
+
+syntax_tree = SyntaxTree('2 + 2*7 - 5 + 8*(3 + 5) + 3',
                          leaf_rules=leaf_types,
-                         node_rules=node_rules)
+                         node_rules=node_rules,
+                         node_rules_modif=node_rules_modif)
 
 print(syntax_tree)
